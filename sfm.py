@@ -26,9 +26,16 @@ def get_init_image_ids(scene_graph: dict) -> (str, str):
     """
     max_pair = [None, None]  # dummy value
     """ YOUR CODE HERE """
-    
-
-
+    # 初始图像对的选择
+    max_num_inliers = 0         # 最大内点计数初始化为零
+    for image_id1 in scene_graph.keys():
+        neighbors = scene_graph[image_id1]
+        for image_id2 in neighbors:          # 载入匹配对并计算内点数量
+            matches = load_matches(image_id1=image_id1, image_id2=image_id2)
+            num_inliers = matches.shape[0]
+            if num_inliers > max_num_inliers:
+                max_num_inliers = num_inliers
+                max_pair = [image_id1, image_id2]
     """ END YOUR CODE HERE """
     image_id1, image_id2 = sorted(max_pair)
     return image_id1, image_id2
@@ -78,9 +85,15 @@ def get_init_extrinsics(image_id1: str, image_id2: str, intrinsics: np.ndarray) 
 
     extrinsics2 = np.zeros(shape=[3, 4], dtype=float)
     """ YOUR CODE HERE """
-    
-
-
+    # 假设 image_id1 的位置在世界坐标系的原点，并且它的外参矩阵为 [I|0]
+    # 其中 I 是单位矩阵，表示没有旋转，0 表示没有平移
+    extrinsics1 = np.array([[1, 0, 0, 0],
+                            [0, 1, 0, 0],
+                            [0, 0, 1, 0]])
+    # 使用基础矩阵 E 和内参矩阵恢复 image_id2 的旋转矩阵 R 和平移向量 t
+    _, R, t, _ = cv2.recoverPose(E=essential_mtx, points1=points2d_1, points2=points2d_2, cameraMatrix=intrinsics)
+    # 将旋转矩阵 R 和平移向量 t 连接成 [R|t] 形式的外参矩阵
+    extrinsics2 = np.concatenate((R, t), axis=1)
     """ END YOUR CODE HERE """
     return extrinsics1, extrinsics2
 
@@ -154,9 +167,21 @@ def get_reprojection_residuals(points2d: np.ndarray, points3d: np.ndarray, intri
     """
     residuals = np.zeros(points2d.shape[0])
     """ YOUR CODE HERE """
-   
-
-
+    # 将三维点转换为齐次坐标形式
+    # 在原有的三维坐标 `points3d` 后面添加一列全为 1 的列向量，使得点变为四维（齐次坐标）
+    homo_3d_points = np.concatenate((points3d, np.ones((points3d.shape[0], 1))), axis=1)
+    homo_3d_points_T = np.transpose(homo_3d_points) # 转置齐次坐标矩阵以便后续矩阵运算，便于矩阵的乘法
+    # 计算投影矩阵 P
+    # 将旋转矩阵 `rotation_mtx` 和平移向量 `tvec` 组合成 `3x4` 的外参矩阵 `extrinsics`
+    extrinsics = np.concatenate([rotation_mtx, tvec.reshape(-1, 1)], axis=1)
+    P = np.matmul(intrinsics, extrinsics)       # 将相机内参矩阵 `intrinsics` 和外参矩阵 `extrinsics` 相乘，得到总的投影矩阵 `P`
+    calculated_pts2d = np.matmul(P, homo_3d_points_T)       # 使用投影矩阵 P 对齐次坐标的三维点进行投影
+    calculated_pts2d /= calculated_pts2d[-1, :] # 将投影结果归一化，以便从齐次坐标转换到非齐次二维坐标
+    calculated_pts2d = calculated_pts2d[:-1]    # 除以最后一行元素，得到标准的二维坐标
+    calculated_pts2d = np.transpose(calculated_pts2d)
+    # 计算残差，即投影后的二维点 `calculated_pts2d` 与实际二维点 `points2d` 之间的欧氏距离
+    # 使用 `np.linalg.norm` 计算每个对应点之间的距离，并沿着每一行（即每个点）求和
+    residuals = np.linalg.norm(points2d - calculated_pts2d, axis=1)
     """ END YOUR CODE HERE """
     return residuals
 
@@ -202,8 +227,31 @@ def solve_pnp(image_id: str, point2d_idxs: np.ndarray, all_points3d: np.ndarray,
         2. convert the returned rotation vector to rotation matrix using cv2.Rodrigues
         3. compute the reprojection residuals
         """
-       
+        # 使用 solvePnP 求解 PnP 问题，得到旋转向量和平移向量
+        # selected_pts3d：选定的三维点
+        # selected_pts2d：对应的二维图像点
+        # intrinsics：相机的内参矩阵
+        # flags=cv2.SOLVEPNP_ITERATIVE 表示使用迭代法求解
+        _, rotation_vector, tvec = cv2.solvePnP(objectPoints=selected_pts3d,
+                                                imagePoints=selected_pts2d,
+                                                cameraMatrix=intrinsics,
+                                                distCoeffs=None,
+                                                flags=cv2.SOLVEPNP_ITERATIVE)
 
+        # 将旋转向量转换为旋转矩阵，以便后续计算投影矩阵
+        rotation_mtx, _ = cv2.Rodrigues(rotation_vector)
+
+        # 调用 get_reprojection_residuals 函数计算重投影残差
+        # points2d：原始二维图像点
+        # points3d：对应的三维世界坐标
+        # intrinsics：相机内参矩阵
+        # rotation_mtx：通过 solvePnP 获得的旋转矩阵
+        # tvec：solvePnP 输出的平移向量
+        residuals = get_reprojection_residuals(points2d=points2d,
+                                               points3d=points3d,
+                                               intrinsics=intrinsics,
+                                               rotation_mtx=rotation_mtx,
+                                               tvec=tvec)
 
         """ END YOUR CODE HERE """
 
@@ -254,8 +302,19 @@ def add_points3d(image_id1: str, image_id2: str, all_extrinsic: dict, intrinsics
     triangulate between the image points for the unregistered matches for image_id1 and image_id2 to get new points3d
     new_points3d = triangulate(..., kp_idxs1=matches[:, 0], kp_idxs2=matches[:, 1], ...)
     """
-    
-
+    # 使用 triangulate 函数计算新三维点 new_points3d
+    # 参数说明：
+    # image_id1, image_id2：图像 ID，用于标识两个视角
+    # kp_idxs1, kp_idxs2：匹配的关键点索引，matches[:, 0] 为图像1的关键点索引，matches[:, 1] 为图像2的关键点索引
+    # extrinsics1, extrinsics2：图像1和图像2的外参矩阵，用于表示相机的旋转和平移
+    # intrinsics：相机的内参矩阵，用于定义相机的焦距和光心位置
+    new_points3d = triangulate(image_id1=image_id1,
+                               image_id2=image_id2,
+                               kp_idxs1=matches[:, 0],
+                               kp_idxs2=matches[:, 1],
+                               extrinsics1=all_extrinsic[image_id1],
+                               extrinsics2=all_extrinsic[image_id2],
+                               intrinsics=intrinsics)
 
     """ END YOUR CODE HERE """
 
@@ -285,10 +344,26 @@ def get_next_pair(scene_graph: dict, registered_ids: list):
     """
     max_new_id, max_registered_id, max_num_inliers = None, None, 0
     """ YOUR CODE HERE """
-    
+    # 遍历已注册的图像 ID
+    for registered_id in registered_ids:
+        # 获取已注册图像在图像关系图中的邻居（即潜在的新图像）
+        neighbors = scene_graph[registered_id]
 
+        # 遍历每个邻居图像
+        for new_id in neighbors:
+            # 检查该邻居图像是否未注册
+            if new_id not in registered_ids:
+                # 加载已注册图像和新图像之间的匹配信息
+                matches = load_matches(registered_id, new_id)
 
-    
+                # 计算内点数量
+                num_inliers = matches.shape[0]
+
+                # 如果当前图像对的内点数量超过之前的最大值，则更新最大内点计数和对应的图像 ID
+                if num_inliers > max_num_inliers:
+                    max_num_inliers = num_inliers
+                    max_new_id = new_id  # 更新当前找到的最佳新图像 ID
+                    max_registered_id = registered_id  # 更新与之匹配的已注册图像 ID
     """ END YOUR CODE HERE """
     return max_new_id, max_registered_id
 

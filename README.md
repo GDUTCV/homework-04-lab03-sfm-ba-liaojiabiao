@@ -1,25 +1,144 @@
-# CS4277/CS5477: Structure from Motion and Bundle Adjustment
+- ## 运动的结构重建 (SfM) 和捆绑调整
 
-## Setting Up
+  ### 1. 总体概况
 
-If you are using Anaconda, you can run the following lines to setup:
-```bash
-conda create -n sfm python==3.7.6
-conda activate sfm
-pip  install -r requirements.txt
-```
+  这是一个增量式基于运动的结构重建（SfM）系统的实现以及用于三维重建的捆绑调整。该任务通过从多张不同视角拍摄的图像中重建场景的三维结构，估计相机参数，并使用捆绑调整优化重建结果。项目的主要组成部分包括特征检测和匹配、增量重建以及优化。
 
-## Running Scripts
-To run the scripts:
-```bash
-python preprocess.py --dataset temple  # performs preprocessing for temple dataset
-python preprocess.py --dataset mini-temple  # performs preprocessing for mini-temple dataset
-python sfm.py --dataset temple # performs structure from motion without bundle adjustment 
-python sfm.py --dataset mini-temple --ba # performs structure from motion with bundle adjustment on mini-temple dataset
-python sfm.py --dataset mini-temple # performs structure from motion without bundle adjustment on mini-temple dataset
-```
+  ### 2. 实现细节
 
-To visualize, run:
-```bash
-python visualize.py --dataset mini-temple  # visualize 3d point cloud from reconstruction.
-```
+  以下部分描述了项目中实现的主要组成部分：
+
+  #### 2.1 预处理 (preprocess.py)
+
+  预处理步骤包括在每张图像中检测关键点，并在图像对之间建立配对匹配。这是通过使用 SIFT（尺度不变特征变换）进行关键点检测，并使用 OpenCV 的 `BFMatcher` 匹配描述符来实现的。我们应用了 Lowe 的比率测试来过滤掉不明确的匹配。
+
+  主要函数：
+  
+  detect_keypoints(image_file)：使用 SIFT 检测关键点，并将其存储在每张图像中。
+  
+  create_feature_matches(image_file1, image_file2)：使用 `BFMatcher` 查找两张图像之间的对应点。create_ransac_matches()：应用 RANSAC 来去除特征匹配中的异常值。
+  
+  - ### 主要代码
+  
+    1. **读取和解析图像数据**：
+  
+       - 代码首先设置了项目路径和数据目录，并解析输入参数以确定数据集（如 `temple` 或 `mini-temple`）和是否进行束调整（Bundle Adjustment）。
+  
+       **特征检测**：
+  
+       - `detect_keypoints` 函数使用 SIFT（尺度不变特征变换）检测图像的关键点并计算描述符。通过 `parallel_processing` 函数实现并行化，提高了处理速度。
+       - 这些特征将被保存在对应的 `pickle` 文件中，供后续特征匹配使用。
+
+       **特征匹配和Lowe比率测试**：
+
+       - `create_feature_matches` 函数使用 BFMatcher 进行暴力匹配，并应用了 Lowe 比率测试筛选出质量更好的匹配对，以减少误匹配对的影响。
+
+       **几何验证（RANSAC）**：
+  
+       - `create_ransac_matches` 函数使用 RANSAC 验证几何一致性，通过基础矩阵（Fundamental Matrix）或本质矩阵（Essential Matrix）的估计，去除掉噪声和误匹配。
+       - 通过验证的匹配对将用于生成可靠的图像对，方便后续的增量式重建。
+  
+       **场景图创建**：
+  
+       - `create_scene_graph` 函数生成一个场景图，表示图像之间的关系。场景图将图像看作节点，匹配关系看作边。只有那些内点数足够多的图像对才会被连接成边，从而保证了图像间配准的可靠性。
+       - 最终生成的场景图被保存为 JSON 文件，供后续三维重建算法使用。
+  
+       **数据预处理和存储**：
+
+       - `preprocess` 和 `main` 函数负责调用各个子函数，进行一系列的特征检测、匹配、几何验证、场景图构建等操作。所有的结果数据都被保存在相应的目录结构中，便于在后续重建过程中使用。
+
+  结果存储在 `predictions/mini-temple/results/no-bundle-adjustment` 目录中，包括捆绑调整和未进行调整的重建过程的结果。
+
+  #### 2.2 增量式结构重建 (sfm.py)
+  
+  增量式 SfM 系统首先选择具有最多内点的初始图像对，从而提供一个稳定的重建基础。然后通过 PnP（透视 n 点）算法配合 RANSAC 增量式地注册新图像，并三角化新的三维点。
+
+  主要步骤：
+  - **初始对选择**：函数 `get_init_image_ids()` 选择具有最多 RANSAC 内点的初始图像对。
+  - **位姿估计**：`get_init_extrinsics()` 使用 `recoverPose()` 估计初始位姿，将第一张图像固定在世界坐标原点。
+  - **三角化**：`triangulate()` 用于通过将匹配的关键点投影到场景中来估计三维点的坐标。
+  - **增量式注册**：`solve_pnp()` 使用 PnP 算法估计新图像的相机位姿，并通过 RANSAC 保证其鲁棒性。
+  - ### 主要代码
+  - ### 1. 初始图像对选择 (`get_init_image_ids`)
+
+    - 选择一个初始的图像对，用于建立增量式 SfM 的初始框架。选择具有最多内点的图像对，以便在重建初始场景时获得更可靠的特征匹配。
+
+    ### 2. 初始外参矩阵计算 (`get_init_extrinsics`)
+  
+    - 根据基础矩阵 `E` 估计两个初始图像的相对姿态。第一个图像设定在世界坐标系的原点 `[I|0]`，第二个图像的外参矩阵 `[R|t]` 是通过 `cv2.recoverPose` 从 `E` 中恢复的。
+  
+    ### 3. 初始三维点生成 (`initialize` 和 `triangulate`)
+  
+    - 使用初始图像对的特征点进行三角化，将匹配的二维特征点转换为三维点坐标，形成初始的三维点云。
+  
+    ### 4. 重投影残差计算 (`get_reprojection_residuals`)
+  
+    - 将三维点投影回图像平面，计算投影点与实际二维点之间的残差。这用于后续的位姿估计和优化。
+  
+    ### 5. 通过 PnP 求解图像位姿 (`solve_pnp`)
+  
+    - 使用 PnP （Perspective-n-Point）算法确定新图像的姿态。该步骤通过 RANSAC 来选择内点，确保配准的准确性。
+  
+    ### 6. 增量式三维点更新 (`add_points3d`)
+  
+    - 新加入图像后，利用三角化生成与新图像相关联的新的三维点。更新对应的三维点和二维特征点的关系。
+  
+    ### 7. 场景拓扑和下一个图像对选择 (`get_next_pair`)
+  
+    - 从场景图中选择下一个待注册的图像，该图像与当前已注册的图像有最多的特征匹配，保证在添加图像时有较高的重建精度。
+  
+    ### 8. 束调整优化 (`bundle_adjustment`)
+  
+    - 使用全局束调整（Bundle Adjustment）对所有图像的姿态和三维点进行优化，减少重投影误差，使得整体重建模型更加准确。
+  
+    ### 9. 增量式 SfM 主流程 (`incremental_sfm`)
+  
+    - 增量式地将每一张新图像配准到三维模型中，更新图像姿态和三维点云。
+    - 若启用了束调整，则在每次添加新图像后对姿态和点云进行优化。
+  
+    ### 10. 主函数 (`main`)
+  
+    - 代码入口，读取场景图文件并设置相机内参。
+    - 初始化增量式 SfM 流程，依次将图像配准，生成最终的三维点云、对应关系和图像姿态。
+    - 将结果保存到文件中，包括三维点云、图像姿态和配准轨迹等。
+  
+  #### 2.3 捆绑调整 (bundle_adjustment.py)
+  
+  捆绑调整通过使用 `scipy.optimize.least_squares` 来最小化整个场景的重投影误差，从而优化三维结构和相机参数。优化过程旨在同时调整所有的三维点和相机位姿，从而得到一致且更准确的三维重建。
+  
+  主要组件：
+  - ### 代码说明
+  
+    1. **参数分解**：将输入的 `parameters` 数组分成相机参数和 3D 点的坐标。
+    2. **外参计算**：对每个相机的旋转向量用 `Rodrigues` 转换成旋转矩阵，然后将旋转矩阵和平移向量拼接，形成 3x4 的外参矩阵。
+    3. **3D 点齐次化**：将 3D 点转换为齐次坐标，以便于矩阵计算。
+    4. **重投影**：使用相机的内参和外参将 3D 点投影到 2D 平面，得到重投影的 2D 坐标。
+    5. **计算残差**：通过 `np.linalg.norm` 计算原始 2D 点和重投影 2D 点之间的欧氏距离，即残差。
+  
+  #### 2.4 结果与输出
+  
+  SfM 系统的结果存储在 `predictions/mini-temple/results/` 目录下，包括 `no-bundle-adjustment` 和 `bundle-adjustment` 文件夹：
+  - **`all-extrinsic.json`**：包含重建后所有相机的外参矩阵。
+  - **`points3d.npy`**：存储重建的三维点。
+  - **`registration-trajectory.txt`**：记录图像注册的顺序。
+  - **`correspondences2d3d.json`**：存储二维关键点与三维点之间的对应关系。
+  
+  ### 3. 观察与总结
+  
+  增量式重建系统运行良好，从多张图像中逐步重建了三维场景。具有良好特征匹配的初始图像对为重建提供了坚实的基础。捆绑调整显著减少了整体重投影误差，改善了三维点和相机位姿的准确性。
+  
+  主要观察：
+  - **初始图像对选择**：初始对的选择对于重建的稳定性至关重要。
+  - **捆绑调整的影响**：捆绑调整显著提高了重建结果的准确性，通过降低重投影误差使得三维模型更加精确。
+  
+  ### 4. 结果
+  
+  ![0](C:\Users\40441\Desktop\homework-04-lab03-sfm-ba-liaojiabiao-master\0.jpg)
+  
+  ![1](C:\Users\40441\Desktop\homework-04-lab03-sfm-ba-liaojiabiao-master\1.png)
+  
+  
+  
+  本次任务成功地展示了如何通过增量式 SfM 系统和捆绑调整来进行三维重建。重建质量取决于特征匹配、PnP 的鲁棒性以及捆绑调整。未来的工作可以考虑改进特征匹配的速度和鲁棒性，并应用全局优化技术以提高整体一致性。
+  
+  通过增量重建和捆绑调整，可以从多张二维图像生成准确且一致的三维模型，为现实世界场景的几何结构提供了深入的洞察。
